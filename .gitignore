@@ -1,0 +1,6 @@
+data/
+.ruff_cache/
+.venv/
+.data/
+__pycache__/
+.python-version
