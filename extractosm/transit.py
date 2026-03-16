@@ -492,7 +492,7 @@ def extract_transit_routes(
         ...     osm_pbf_path="geneva.osm.pbf",
         ...     include_stop_ids=True,
         ... )
-        >>> print(routes[['route', 'name', 'stop_count']].head())
+        >>> print(routes[['route', 'name']].head())
     """
     # Set default route types
     if route_types is None:
@@ -634,7 +634,7 @@ def extract_all_transit_routes(
         output_path (str, optional): Path to save GeoParquet file. If provided,
             the extracted routes will be saved to this path with a warning message.
         include_stop_ids (bool): If True, adds stop_ids (list of stop OSM IDs)
-            and stop_count (number of stops) columns to the output GeoDataFrame.
+            columns to the output GeoDataFrame.
             Default is False.
 
     Returns:
@@ -651,7 +651,6 @@ def extract_all_transit_routes(
             - website: Route website URL
             - geometry: Route path (LineString/MultiLineString)
             - stop_ids: (if include_stop_ids=True) List of stop OSM IDs on this route
-            - stop_count: (if include_stop_ids=True) Number of stops on this route
 
     Examples:
         >>> # Extract all routes from PBF file
@@ -951,7 +950,27 @@ def extract_transit_network(
     crs: str = "EPSG:4326",
     include_stop_ids: bool = False,
     include_route_ids: bool = False,
+    output_dir: Optional[str] = None,
 ) -> dict:
+    """
+    Extract transit routes and stops from OSM PBF file.
+
+    This function extracts transit routes and stops from an OSM PBF file, applies
+    optional filtering by route type and network, and returns the results as GeoDataFrames.
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+        route_types (list[str], optional): List of route types to include (e.g., ["train", "bus"]). Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+        include_networks (list[str], optional): List of network names to include. If None, includes all networks. Default is None.
+        exclude_networks (list[str], optional): List of network names to exclude. If None, excludes no networks. Default is None.
+        group_by_ref (bool): If True, groups routes by (ref, network) and combines bidirectional routes. Default is True.
+        include_all_route_stops (bool): If True, includes all stops that are members of the extracted routes, even if they fall outside the bounding box
+            when using extract_transit_routes(). Default is True.
+        crs (str): Coordinate reference system for output GeoDataFrames. Default is "EPSG:4326".
+        include_stop_ids (bool): If True, adds stop_ids column to routes GeoDataFrame. Default is False.
+        include_route_ids (bool): If True, adds route_ids column to stops GeoDataFrame. Default is False.
+        output_dir (str, optional): If provided, saves intermediate GeoParquet files for routes
+    """
 
     # TODO: switch to a bbox-based approach, make it optional as a parameter
 
@@ -1189,6 +1208,16 @@ def extract_transit_network(
     else:
         # Original behavior: only stops within isochrone
         final_stops = stops.copy()
+
+    if output_dir is not None:
+        routes_output_path = os.path.join(output_dir, "routes.geoparquet")
+        final_routes.to_parquet(routes_output_path)
+        print(f"Saved {len(final_routes)} routes to {routes_output_path}")
+
+        stops_output_path = os.path.join(output_dir, "stops.geoparquet")
+        final_stops.to_parquet(stops_output_path)
+        print(f"Saved {len(final_stops)} stops to {stops_output_path}")
+        
 
     return {
         "routes": final_routes,  # Unclipped, optionally grouped
