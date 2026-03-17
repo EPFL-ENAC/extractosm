@@ -8,8 +8,7 @@ import osmium
 import osmium.geom
 import pandas as pd
 import pyogrio
-from importlib.resources import files
-from shapely import box, union_all, wkb
+from shapely import wkb
 import pyarrow  # noqa: F401 - for checking if pyarrow is installed when saving GeoParquet
 
 from extractosm.utils import _parse_osm_tags
@@ -111,7 +110,10 @@ def extract_transit_stops(
             - transit_mode (str): Inferred mode ("train", "bus", "tram", "metro", "mixed", or None)
             - railway (str): Value of railway tag (may be None)
             - public_transport (str): Value of public_transport tag (may be None)
+            - stop_area_id (int): OSM stop_area relation ID (None if not in any stop_area)
+            - stop_area_name (str): Stop area name (None if not in any stop_area)
             - route_ids (list[int]): List of route OSM IDs serving this stop (only if include_route_ids=True)
+            - route_count (int): Number of routes serving this stop (only if include_route_ids=True)
             - geometry (Point): Point location
 
     Raises:
@@ -129,6 +131,19 @@ def extract_transit_stops(
         >>> # Get all train stops (includes stations and stop_positions)
         >>> train_stops = stops[stops["transit_mode"] == "train"]
         >>> print(f"Found {len(train_stops)} train stops")
+
+        >>> # Check which stops belong to stop_areas
+        >>> stops_with_areas = stops[stops['stop_area_id'].notna()]
+        >>> print(f"{len(stops_with_areas)} of {len(stops)} stops belong to stop_areas")
+
+        >>> # Analyze stops by stop_area
+        >>> stops.groupby('stop_area_name').agg({'osm_id': 'count', 'name': list})
+
+    Notes:
+        - Most stops won't belong to a stop_area (stop_area_id will be None)
+        - Stop areas are more common in major stations and interchanges
+        - A stop_area groups multiple platforms, stop_positions, and related infrastructure
+        - Performance: ~10-20 seconds for 68MB file (includes node extraction + filtering)
     """
     # Validate bounding box
     if not (isinstance(bounding_box, (tuple, list)) and len(bounding_box) == 4):
@@ -262,6 +277,22 @@ def extract_transit_stops(
             lambda stop_id: stop_route_mapping.get(stop_id, [])
         )
 
+    # Add stop_area information (always included)
+    if not gdf.empty:
+        # Get stop→stop_area mapping
+        stop_to_sa = get_stop_to_stop_area_mapping(osm_pbf_path=osm_pbf_path)
+
+        # Get full stop_area details
+        stop_areas = get_stop_areas(osm_pbf_path=osm_pbf_path)
+
+        # Add stop_area columns
+        gdf["stop_area_id"] = gdf["osm_id"].apply(lambda sid: stop_to_sa.get(sid))
+        gdf["stop_area_name"] = gdf["stop_area_id"].apply(
+            lambda said: (
+                stop_areas[said]["name"] if said and said in stop_areas else None
+            )
+        )
+
     return gdf
 
 
@@ -318,8 +349,7 @@ def extract_all_transit_stops(
     """
     if not osm_pbf_path or not os.path.exists(osm_pbf_path):
         raise ValueError(
-            f"OSM PBF file not found: {osm_pbf_path}. "
-            "Provide a valid path."
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
         )
 
     # Check if pyarrow is available if output_path is specified
@@ -430,6 +460,7 @@ def extract_transit_routes(
     route_types: list[str] | None = None,
     crs: str = "EPSG:4326",
     include_stop_ids: bool = False,
+    group_by: str = "route",
 ) -> gpd.GeoDataFrame:
     """
     Get fixed-route transit systems within a bounding box.
@@ -437,7 +468,8 @@ def extract_transit_routes(
     This function retrieves OpenStreetMap route relations for public transport
     services (train, bus, tram, etc.) based on the specified route types and
     bounding box. The retrieved routes are returned as a GeoDataFrame with
-    route metadata and geometries.
+    route metadata and geometries. Routes can be grouped by route_master
+    (service level) or kept as individual variants (directional).
 
     Args:
         bounding_box (tuple): A tuple of (west, south, east, north) coordinates.
@@ -453,10 +485,15 @@ def extract_transit_routes(
         include_stop_ids (bool): If True, adds stop_ids (list of stop OSM IDs)
             and stop_count (number of stops) columns to the output GeoDataFrame.
             Default is False.
+        group_by (str): How to group routes in the output. Default is "route".
+            - "route": One row per route variant (e.g., "Bus 7 A→B" and "Bus 7 B→A" are separate)
+            - "route_master": One row per service (e.g., single "Bus 7" row combining all variants)
+            - None: No grouping (may include duplicate routes from overlapping relations)
 
     Returns:
-        gpd.GeoDataFrame: A GeoDataFrame containing transit routes with the
-        following columns:
+        gpd.GeoDataFrame: A GeoDataFrame containing transit routes.
+
+        For group_by='route' (default):
             - osm_id: OSM relation ID
             - osm_type: OSM element type (typically "relation")
             - route: Route type (bus, train, tram, etc.)
@@ -467,8 +504,26 @@ def extract_transit_routes(
             - network: Transit network name
             - operator: Operating company
             - website: Route website URL
+            - route_master_id: OSM route_master relation ID (None if not in route_master)
+            - route_master_ref: Route master reference number (e.g., "7")
+            - route_master_name: Route master name (e.g., "Bus 7")
             - geometry: Route path (LineString) or centroid (Point)
             - stop_ids: (if include_stop_ids=True) List of stop OSM IDs on this route
+            - stop_count: (if include_stop_ids=True) Number of stops on this route
+
+        For group_by='route_master':
+            - osm_id: OSM route_master relation ID
+            - route_master_ref: Route reference number (e.g., "7")
+            - route_master_name: Route name (e.g., "Bus 7")
+            - route: Route type (bus, tram, trolleybus, etc.)
+            - network: Transit network name
+            - operator: Operating company
+            - website: Website URL
+            - variant_count: Number of route variants (directions)
+            - variant_route_ids: list[int] of member route relation IDs
+            - geometry: MultiLineString (union of all variant geometries)
+            - stop_ids: (if include_stop_ids=True) Union of stops across all variants
+            - stop_count: (if include_stop_ids=True) Total unique stops
 
     Raises:
         ValueError: If bounding_box is not a tuple/list of exactly 4 elements,
@@ -492,7 +547,19 @@ def extract_transit_routes(
         ...     osm_pbf_path="geneva.osm.pbf",
         ...     include_stop_ids=True,
         ... )
-        >>> print(routes[['route', 'name']].head())
+        >>> print(routes[['route', 'name', 'stop_count']].head())
+
+        >>> # Group by route_master for service-level view
+        >>> routes = extract_transit_routes(
+        ...     bbox,
+        ...     osm_pbf_path="lausanne.osm.pbf",
+        ...     group_by="route_master",
+        ... )
+        >>> print(f"Found {len(routes)} transit services")
+
+        >>> # Keep route variants but analyze by route_master
+        >>> routes = extract_transit_routes(bbox, "lausanne.osm.pbf")
+        >>> routes.groupby('route_master_ref').agg({'osm_id': 'count', 'name': 'first'})
     """
     # Set default route types
     if route_types is None:
@@ -511,7 +578,7 @@ def extract_transit_routes(
     if osm_pbf_path and not os.path.exists(osm_pbf_path):
         raise ValueError(
             f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path"
-        )   
+        )
 
     # Try reading from multilinestrings layer first (where route relations are stored)
     gdf_raw = pyogrio.read_dataframe(
@@ -590,7 +657,34 @@ def extract_transit_routes(
     # Reset index
     gdf = gdf.reset_index(drop=True)
 
-    # Add stop IDs if requested
+    # Add route_master information (always included)
+    if not gdf.empty:
+        # Get route→route_master mapping
+        route_to_rm = get_route_to_route_master_mapping(
+            osm_pbf_path=osm_pbf_path,
+            route_types=route_types,
+        )
+
+        # Get full route_master details
+        route_masters = get_route_masters(
+            osm_pbf_path=osm_pbf_path,
+            route_types=route_types,
+        )
+
+        # Add route_master columns
+        gdf["route_master_id"] = gdf["osm_id"].apply(lambda rid: route_to_rm.get(rid))
+        gdf["route_master_ref"] = gdf["route_master_id"].apply(
+            lambda rmid: (
+                route_masters[rmid]["ref"] if rmid and rmid in route_masters else None
+            )
+        )
+        gdf["route_master_name"] = gdf["route_master_id"].apply(
+            lambda rmid: (
+                route_masters[rmid]["name"] if rmid and rmid in route_masters else None
+            )
+        )
+
+    # Add stop IDs if requested (before grouping, so we can aggregate stops)
     if include_stop_ids and not gdf.empty:
         # Get route-stop mapping (extracts from entire PBF file)
         route_stop_mapping = get_route_stop_mapping(
@@ -605,6 +699,93 @@ def extract_transit_routes(
 
         # Add stop_ids column
         gdf["stop_ids"] = gdf["osm_id"].apply(lambda rid: route_to_stops.get(rid, []))
+        gdf["stop_count"] = gdf["stop_ids"].apply(len)
+
+    # Apply grouping if requested
+    if group_by == "route_master" and not gdf.empty:
+        # Filter to only routes that have a route_master
+        grouped_routes = gdf[gdf["route_master_id"].notna()].copy()
+        ungrouped_routes = gdf[gdf["route_master_id"].isna()].copy()
+
+        if not grouped_routes.empty:
+            # Group by route_master_id
+            agg_dict = {
+                "route_master_ref": "first",
+                "route_master_name": "first",
+                "route": "first",  # route type (bus, tram, etc.)
+                "network": "first",
+                "operator": "first",
+                "website": "first",
+                "osm_id": list,  # collect all route IDs → rename to variant_route_ids
+                "geometry": lambda geoms: geoms.union_all(),  # union all geometries
+            }
+
+            # If stop_ids exist, aggregate them too
+            if "stop_ids" in grouped_routes.columns:
+                agg_dict["stop_ids"] = lambda stops: list(
+                    set(sum(stops.tolist(), []))
+                )  # union of all stop lists
+
+            grouped_gdf = grouped_routes.groupby("route_master_id", as_index=False).agg(
+                agg_dict
+            )
+
+            # Rename columns
+            grouped_gdf = grouped_gdf.rename(
+                columns={
+                    "osm_id": "variant_route_ids",
+                    "route_master_id": "osm_id",  # route_master_id becomes the primary ID
+                }
+            )
+
+            # Add variant_count
+            grouped_gdf["variant_count"] = grouped_gdf["variant_route_ids"].apply(len)
+
+            # Recalculate stop_count if stop_ids exist
+            if "stop_ids" in grouped_gdf.columns:
+                grouped_gdf["stop_count"] = grouped_gdf["stop_ids"].apply(len)
+
+            # Reorder columns
+            base_cols = [
+                "osm_id",
+                "route_master_ref",
+                "route_master_name",
+                "route",
+                "network",
+                "operator",
+                "website",
+                "variant_count",
+                "variant_route_ids",
+            ]
+            if "stop_ids" in grouped_gdf.columns:
+                base_cols.extend(["stop_ids", "stop_count"])
+            base_cols.append("geometry")
+
+            # Keep only columns that exist
+            base_cols = [col for col in base_cols if col in grouped_gdf.columns]
+            grouped_gdf = grouped_gdf[base_cols]
+
+            # Combine with ungrouped routes (if any)
+            if not ungrouped_routes.empty:
+                # Add placeholder columns to ungrouped routes to match schema
+                ungrouped_routes["variant_count"] = 1
+                ungrouped_routes["variant_route_ids"] = ungrouped_routes[
+                    "osm_id"
+                ].apply(lambda x: [x])
+                # Reorder ungrouped routes columns to match grouped
+                ungrouped_routes = ungrouped_routes[base_cols]
+                gdf = pd.concat([grouped_gdf, ungrouped_routes], ignore_index=True)
+            else:
+                gdf = grouped_gdf
+
+            # Convert back to GeoDataFrame
+            gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=crs)
+            gdf = gdf.reset_index(drop=True)
+
+    elif group_by is None:
+        # No grouping - return as-is (may have duplicates)
+        pass
+    # else: group_by == "route" (default) - already in this format
 
     return gdf
 
@@ -615,6 +796,7 @@ def extract_all_transit_routes(
     crs: str = "EPSG:4326",
     output_path: Optional[str] = None,
     include_stop_ids: bool = False,
+    group_by: str = "route",
 ) -> gpd.GeoDataFrame:
     """
     Extract ALL transit routes from OSM PBF file and save to GeoParquet.
@@ -636,6 +818,11 @@ def extract_all_transit_routes(
         include_stop_ids (bool): If True, adds stop_ids (list of stop OSM IDs)
             columns to the output GeoDataFrame.
             Default is False.
+        group_by (str): How to group route variants. Options:
+            - "route" (default): One row per route relation (individual directional variants)
+            - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
+            - None: No grouping (may contain duplicate geometries)
+            Default is "route".
 
     Returns:
         gpd.GeoDataFrame: GeoDataFrame containing all transit routes with columns:
@@ -690,6 +877,7 @@ def extract_all_transit_routes(
         crs=crs,
         osm_pbf_path=osm_pbf_path,
         include_stop_ids=include_stop_ids,
+        group_by=group_by,
     )
 
     # Save to GeoParquet if output path specified
@@ -805,8 +993,7 @@ def get_route_stop_mapping(
 
     if not osm_pbf_path or not os.path.exists(osm_pbf_path):
         raise ValueError(
-            f"OSM PBF file not found: {osm_pbf_path}. "
-            "Provide a valid path."
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
         )
 
     # Extract route-stop mapping using pyosmium
@@ -940,12 +1127,246 @@ def load_route_stop_mapping(input_path: str) -> dict[int, list[int]]:
     return mapping
 
 
+def get_route_masters(
+    osm_pbf_path: str,
+    route_types: list[str] | None = None,
+) -> dict[int, dict]:
+    """
+    Extract route_master relations from OSM data.
+
+    A route_master relation groups all directional variants of a transit service
+    (e.g., "Bus 7" contains both "Bus 7: A→B" and "Bus 7: B→A" routes).
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+        route_types (list[str], optional): List of route types to extract.
+            Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+
+    Returns:
+        dict[int, dict]: Dictionary mapping route_master_id (int) to dict with:
+            - 'name': str - Route master name (e.g., "Bus 7")
+            - 'ref': str - Route reference number (e.g., "7")
+            - 'route_master': str - Type (bus, tram, trolleybus, etc.)
+            - 'network': str - Transit network name
+            - 'operator': str - Operating company
+            - 'member_route_ids': list[int] - Member route relation IDs
+
+    Examples:
+        >>> route_masters = get_route_masters("lausanne.osm.pbf")
+        >>> rm = route_masters[3210864]  # Bus 7 route_master
+        >>> print(f"{rm['name']}: {len(rm['member_route_ids'])} variants")
+        Bus 7: 2 variants
+
+        >>> # Count route_masters by type
+        >>> from collections import Counter
+        >>> types = [rm['route_master'] for rm in route_masters.values()]
+        >>> print(Counter(types))
+        Counter({'bus': 400, 'tram': 50, 'train': 30})
+    """
+    # Set defaults
+    if route_types is None:
+        route_types = ["train", "bus", "tram", "subway", "trolleybus", "light_rail"]
+
+    if not osm_pbf_path or not os.path.exists(osm_pbf_path):
+        raise ValueError(
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
+        )
+
+    # Extract route_masters using pyosmium
+    class RouteMasterHandler(osmium.SimpleHandler):
+        def __init__(self, route_types):
+            super().__init__()
+            self.route_types = set(route_types)
+            self.route_masters = {}
+
+        def relation(self, r):
+            # Check if it's a route_master relation
+            if r.tags.get("type") != "route_master":
+                return
+
+            route_master_type = r.tags.get("route_master")
+            if route_master_type not in self.route_types:
+                return
+
+            # Extract member route relation IDs
+            member_route_ids = []
+            for member in r.members:
+                if member.type == "r":  # relation
+                    member_route_ids.append(member.ref)
+
+            # Store route_master info
+            self.route_masters[r.id] = {
+                "name": r.tags.get("name"),
+                "ref": r.tags.get("ref"),
+                "route_master": route_master_type,
+                "network": r.tags.get("network"),
+                "operator": r.tags.get("operator"),
+                "member_route_ids": member_route_ids,
+            }
+
+    # Process the OSM file
+    handler = RouteMasterHandler(route_types)
+    handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    return handler.route_masters
+
+
+def get_stop_areas(
+    osm_pbf_path: str,
+) -> dict[int, dict]:
+    """
+    Extract stop_area relations from OSM data.
+
+    A stop_area relation groups all elements of a transit stop (platforms,
+    stop_positions, shelters, etc.) into a single logical stop.
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+
+    Returns:
+        dict[int, dict]: Dictionary mapping stop_area_id (int) to dict with:
+            - 'name': str - Stop area name
+            - 'network': str - Transit network name
+            - 'operator': str - Operating company
+            - 'member_stop_ids': list[int] - Node IDs with role=stop
+            - 'member_platform_ids': list[int] - Node/way IDs with role=platform
+
+    Examples:
+        >>> stop_areas = get_stop_areas("lausanne.osm.pbf")
+        >>> sa = stop_areas[4830941]  # Béthusy stop area
+        >>> print(f"{sa['name']}: {len(sa['member_stop_ids'])} stops")
+        Béthusy: 3 stops
+
+        >>> # Find stop_areas with most stops
+        >>> sorted_sa = sorted(
+        ...     stop_areas.items(),
+        ...     key=lambda x: len(x[1]['member_stop_ids']),
+        ...     reverse=True
+        ... )
+        >>> print(f"Largest stop area: {sorted_sa[0][1]['name']}")
+    """
+    if not osm_pbf_path or not os.path.exists(osm_pbf_path):
+        raise ValueError(
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
+        )
+
+    # Extract stop_areas using pyosmium
+    class StopAreaHandler(osmium.SimpleHandler):
+        def __init__(self):
+            super().__init__()
+            self.stop_areas = {}
+
+        def relation(self, r):
+            # Check if it's a stop_area relation
+            if r.tags.get("public_transport") != "stop_area":
+                return
+
+            # Extract member stops and platforms
+            member_stop_ids = []
+            member_platform_ids = []
+
+            for member in r.members:
+                role = member.role
+                # Collect stops (node members with stop role)
+                if "stop" in role and member.type == "n":
+                    member_stop_ids.append(member.ref)
+                # Collect platforms (node/way members with platform role)
+                elif "platform" in role:
+                    member_platform_ids.append(member.ref)
+
+            # Store stop_area info
+            self.stop_areas[r.id] = {
+                "name": r.tags.get("name"),
+                "network": r.tags.get("network"),
+                "operator": r.tags.get("operator"),
+                "member_stop_ids": member_stop_ids,
+                "member_platform_ids": member_platform_ids,
+            }
+
+    # Process the OSM file
+    handler = StopAreaHandler()
+    handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    return handler.stop_areas
+
+
+def get_route_to_route_master_mapping(
+    osm_pbf_path: str,
+    route_types: list[str] | None = None,
+) -> dict[int, int]:
+    """
+    Create mapping from route_id to its parent route_master_id.
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+        route_types (list[str], optional): List of route types.
+            Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+
+    Returns:
+        dict[int, int]: Dictionary mapping route_id to route_master_id.
+
+    Examples:
+        >>> mapping = get_route_to_route_master_mapping("lausanne.osm.pbf")
+        >>> route_master_id = mapping.get(33560)  # route 33560
+        >>> print(f"Route 33560 belongs to route_master {route_master_id}")
+        Route 33560 belongs to route_master 3210864
+
+        >>> # Count how many routes have a route_master
+        >>> print(f"{len(mapping)} routes belong to a route_master")
+        215 routes belong to a route_master
+    """
+    # Get all route_masters
+    route_masters = get_route_masters(osm_pbf_path, route_types)
+
+    # Invert: for each route_master, map its member routes to the route_master_id
+    route_to_rm = {}
+    for rm_id, rm_data in route_masters.items():
+        for route_id in rm_data["member_route_ids"]:
+            route_to_rm[route_id] = rm_id
+
+    return route_to_rm
+
+
+def get_stop_to_stop_area_mapping(
+    osm_pbf_path: str,
+) -> dict[int, int]:
+    """
+    Create mapping from stop_id to its parent stop_area_id.
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+
+    Returns:
+        dict[int, int]: Dictionary mapping stop_id to stop_area_id.
+
+    Examples:
+        >>> mapping = get_stop_to_stop_area_mapping("lausanne.osm.pbf")
+        >>> stop_area_id = mapping.get(347549332)  # stop node
+        >>> print(f"Stop 347549332 belongs to stop_area {stop_area_id}")
+        Stop 347549332 belongs to stop_area 4830941
+
+        >>> # Count how many stops belong to a stop_area
+        >>> print(f"{len(mapping)} stops belong to a stop_area")
+        30 stops belong to a stop_area
+    """
+    # Get all stop_areas
+    stop_areas = get_stop_areas(osm_pbf_path)
+
+    # Invert: for each stop_area, map its member stops to the stop_area_id
+    stop_to_sa = {}
+    for sa_id, sa_data in stop_areas.items():
+        for stop_id in sa_data["member_stop_ids"]:
+            stop_to_sa[stop_id] = sa_id
+
+    return stop_to_sa
+
+
 def extract_transit_network(
     osm_pbf_path: str,
     route_types: list[str] | None = None,
     include_networks: Optional[list[str]] = None,
     exclude_networks: Optional[list[str]] = None,
-    group_by_ref: bool = True,
+    group_by: str = "route",
     include_all_route_stops: bool = True,
     crs: str = "EPSG:4326",
     include_stop_ids: bool = False,
@@ -999,7 +1420,6 @@ def extract_transit_network(
         return {
             "routes": routes.iloc[:0].copy(),  # Empty GDF with same schema
             "stops": stops.iloc[:0].copy(),
-            "grouped_routes_info": None if group_by_ref else None,
         }
 
     filtered_routes = routes.copy()
@@ -1026,165 +1446,16 @@ def extract_transit_network(
         # Remove temporary column
         filtered_routes = filtered_routes.drop(columns=["_network_lower"])
 
-    # Group routes by (ref, network) if requested (NEW FEATURE #3)
-    grouped_routes_info = None
-    if group_by_ref and not filtered_routes.empty:
-        # Separate routes with complete info (ref, from, to) from others
-        has_required_fields = (
-            filtered_routes["ref"].notna()
-            & filtered_routes["from"].notna()
-            & filtered_routes["to"].notna()
-        )
-
-        routes_with_ref = filtered_routes[has_required_fields].copy()
-        routes_without_ref = filtered_routes[~has_required_fields].copy()
-
-        if not routes_with_ref.empty:
-            # Normalize from/to for matching (case-insensitive, stripped)
-            routes_with_ref["_from_norm"] = (
-                routes_with_ref["from"].str.strip().str.lower()
-            )
-            routes_with_ref["_to_norm"] = routes_with_ref["to"].str.strip().str.lower()
-            routes_with_ref["_network_clean"] = routes_with_ref["network"].fillna("")
-
-            # Find bidirectional pairs within each (ref, network) group
-            grouped_list = []
-            ungrouped_list = []
-            processed_ids = set()
-
-            # Group by (ref, network)
-            for group_key, group_df in routes_with_ref.groupby(
-                ["ref", "_network_clean"]
-            ):
-                group_routes = list(group_df.iterrows())
-
-                # Try to find bidirectional pairs
-                for i, (idx_a, route_a) in enumerate(group_routes):
-                    if route_a["osm_id"] in processed_ids:
-                        continue
-
-                    # Look for a matching bidirectional route
-                    paired = False
-                    for j, (idx_b, route_b) in enumerate(
-                        group_routes[i + 1 :], start=i + 1
-                    ):
-                        if route_b["osm_id"] in processed_ids:
-                            continue
-
-                        # Check if bidirectional: A.from==B.to AND A.to==B.from (normalized)
-                        if (
-                            route_a["_from_norm"] == route_b["_to_norm"]
-                            and route_a["_to_norm"] == route_b["_from_norm"]
-                        ):
-                            # Found a bidirectional pair! Combine them
-                            name_a = route_a.get("name", "")
-                            name_b = route_b.get("name", "")
-                            combined_name = (
-                                f"{name_a} / {name_b}".strip(" / ")
-                                if name_a or name_b
-                                else None
-                            )
-
-                            combined_route = {
-                                "osm_id": route_a[
-                                    "osm_id"
-                                ],  # Use first route's ID as primary
-                                "osm_ids": [route_a["osm_id"], route_b["osm_id"]],
-                                "route": route_a["route"],
-                                "ref": route_a["ref"],
-                                "network": route_a["network"],
-                                "name": combined_name,
-                                "from": f"{route_a['from']} ↔ {route_a['to']}",  # Bidirectional indicator
-                                "to": None,  # Not applicable for bidirectional
-                                "operator": route_a.get("operator"),
-                                "website": route_a.get("website"),
-                                "geometry": union_all(
-                                    [route_a["geometry"], route_b["geometry"]]
-                                ),
-                                "route_count": 2,
-                            }
-
-                            grouped_list.append(combined_route)
-                            processed_ids.add(route_a["osm_id"])
-                            processed_ids.add(route_b["osm_id"])
-                            paired = True
-                            break
-
-                    # If no pair found, keep route ungrouped
-                    if not paired:
-                        ungrouped_dict = route_a.to_dict()
-                        ungrouped_dict["route_count"] = 1
-                        ungrouped_dict["osm_ids"] = [route_a["osm_id"]]
-                        # Remove temporary columns
-                        for temp_col in ["_from_norm", "_to_norm", "_network_clean"]:
-                            ungrouped_dict.pop(temp_col, None)
-                        ungrouped_list.append(ungrouped_dict)
-                        processed_ids.add(route_a["osm_id"])
-
-            # Create GeoDataFrames from lists
-            if grouped_list:
-                grouped_gdf = gpd.GeoDataFrame(grouped_list, crs=routes.crs)
-            else:
-                # Create empty GeoDataFrame with geometry column
-                grouped_gdf = gpd.GeoDataFrame([], geometry=[], crs=routes.crs)
-
-            if ungrouped_list:
-                ungrouped_gdf = gpd.GeoDataFrame(ungrouped_list, crs=routes.crs)
-                # Remove temporary columns if they exist
-                for temp_col in ["_from_norm", "_to_norm", "_network_clean"]:
-                    if temp_col in ungrouped_gdf.columns:
-                        ungrouped_gdf = ungrouped_gdf.drop(columns=[temp_col])
-            else:
-                # Create empty GeoDataFrame with geometry column
-                ungrouped_gdf = gpd.GeoDataFrame([], geometry=[], crs=routes.crs)
-
-            # Add route_count and osm_ids to routes_without_ref
-            if not routes_without_ref.empty:
-                routes_without_ref["route_count"] = 1
-                routes_without_ref["osm_ids"] = routes_without_ref["osm_id"].apply(
-                    lambda x: [x]
-                )
-
-            # Combine all routes
-            final_routes = pd.concat(
-                [grouped_gdf, ungrouped_gdf, routes_without_ref], ignore_index=True
-            )
-
-            # Convert to GeoDataFrame
-            final_routes = gpd.GeoDataFrame(final_routes, crs=routes.crs)
-
-            # Create grouping info for return
-            grouped_routes_info = {
-                "total_original_routes": len(filtered_routes),
-                "bidirectional_pairs_found": len(grouped_list),
-                "routes_without_pair": len(ungrouped_list),
-                "routes_missing_ref_from_to": len(routes_without_ref),
-                "final_route_count": len(final_routes),
-            }
-        else:
-            # No routes have required fields for grouping
-            if not routes_without_ref.empty:
-                routes_without_ref["route_count"] = 1
-                routes_without_ref["osm_ids"] = routes_without_ref["osm_id"].apply(
-                    lambda x: [x]
-                )
-            final_routes = routes_without_ref
-            grouped_routes_info = {
-                "total_original_routes": len(filtered_routes),
-                "bidirectional_pairs_found": 0,
-                "routes_without_pair": 0,
-                "routes_missing_ref_from_to": len(routes_without_ref),
-                "final_route_count": len(final_routes),
-            }
-    else:
-        # Grouping disabled
-        final_routes = filtered_routes
+    # Grouping disabled
+    final_routes = filtered_routes
 
     # Get stops to return
     if include_all_route_stops and not final_routes.empty:
         # Get all route IDs (handling both grouped and ungrouped routes)
         all_route_ids = set()
-        route_stop_mapping = get_route_stop_mapping(osm_pbf_path, route_types=route_types)
+        route_stop_mapping = get_route_stop_mapping(
+            osm_pbf_path, route_types=route_types
+        )
 
         if "osm_ids" in final_routes.columns:
             # Grouped routes: flatten list of osm_ids
@@ -1217,10 +1488,8 @@ def extract_transit_network(
         stops_output_path = os.path.join(output_dir, "stops.geoparquet")
         final_stops.to_parquet(stops_output_path)
         print(f"Saved {len(final_stops)} stops to {stops_output_path}")
-        
 
     return {
-        "routes": final_routes,  # Unclipped, optionally grouped
+        "routes": final_routes,  # Unclipped
         "stops": final_stops,  # All stops on routes or original stops if include_all_route_stops=False
-        "grouped_routes_info": grouped_routes_info,  # None if group_by_ref=False
     }
