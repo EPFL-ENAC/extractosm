@@ -2,9 +2,7 @@ import os
 from typing import Dict, Optional
 
 import geopandas as gpd
-import osmnx
 import pyogrio
-from importlib.resources import files
 
 from extractosm.utils import _parse_osm_tags
 
@@ -47,8 +45,7 @@ def get_osm_features(
 
     if not osm_pbf_path or not os.path.exists(osm_pbf_path):
         raise ValueError(
-            f"OSM PBF file not found: {osm_pbf_path}. "
-            "Provide a valid path."
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
         )
 
     # If a local OSM PBF is provided and exists, use the pyosmium handler
