@@ -77,6 +77,8 @@ pbf-lausanne: ## Extract OSM data for Lausanne area
 	osmium extract -b 6.5,46.5,6.8,46.6 .data/geofabrik/switzerland-latest.osm.pbf -o .data/lausanne-all.osm.pbf
 	@mkdir -p data
 	osmium tags-filter .data/lausanne-all.osm.pbf --overwrite -o data/lausanne-filtered.osm.pbf \
-		n/amenity,n/healthcare,n/office,n/public_transport,n/shop,n/tourism,n/highway=bus_stop,n/railway \
-		a/amenity,a/healthcare,a/office,a/public_transport,a/shop,a/tourism \
-		nwr/route=bus,tram,train,subway,trolleybus,light_rail,ferry,monorail,trolleybus
+		n/public_transport,n/highway=bus_stop,n/railway \
+		a/public_transport \
+		nwr/route=bus,tram,train,subway,trolleybus,light_rail,ferry,monorail,trolleybus \
+		r/type=route_master \
+		r/public_transport=stop_area
