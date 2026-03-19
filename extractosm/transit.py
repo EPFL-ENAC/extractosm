@@ -460,6 +460,7 @@ def extract_transit_routes(
     route_types: list[str] | None = None,
     crs: str = "EPSG:4326",
     include_stop_ids: bool = False,
+    include_way_ids: bool = False,
     group_by: str = "route",
 ) -> gpd.GeoDataFrame:
     """
@@ -485,6 +486,9 @@ def extract_transit_routes(
         include_stop_ids (bool): If True, adds stop_ids (list of stop OSM IDs)
             and stop_count (number of stops) columns to the output GeoDataFrame.
             Default is False.
+        include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
+            and way_count (number of highway ways) columns to the output GeoDataFrame.
+            Only ways with non-empty highway tags are included. Default is False.
         group_by (str): How to group routes in the output. Default is "route".
             - "route": One row per route variant (e.g., "Bus 7 A→B" and "Bus 7 B→A" are separate)
             - "route_master": One row per service (e.g., single "Bus 7" row combining all variants)
@@ -510,6 +514,8 @@ def extract_transit_routes(
             - geometry: Route path (LineString) or centroid (Point)
             - stop_ids: (if include_stop_ids=True) List of stop OSM IDs on this route
             - stop_count: (if include_stop_ids=True) Number of stops on this route
+            - way_ids: (if include_way_ids=True) List of way OSM IDs with highway tags composing route
+            - way_count: (if include_way_ids=True) Number of highway ways on this route
 
         For group_by='route_master':
             - osm_id: OSM route_master relation ID
@@ -524,6 +530,8 @@ def extract_transit_routes(
             - geometry: MultiLineString (union of all variant geometries)
             - stop_ids: (if include_stop_ids=True) Union of stops across all variants
             - stop_count: (if include_stop_ids=True) Total unique stops
+            - way_ids: (if include_way_ids=True) Union of highway ways across all variants
+            - way_count: (if include_way_ids=True) Total unique highway ways
 
     Raises:
         ValueError: If bounding_box is not a tuple/list of exactly 4 elements,
@@ -548,6 +556,14 @@ def extract_transit_routes(
         ...     include_stop_ids=True,
         ... )
         >>> print(routes[['route', 'name', 'stop_count']].head())
+
+        >>> # Get routes with way IDs (highway segments)
+        >>> routes = extract_transit_routes(
+        ...     bbox,
+        ...     osm_pbf_path="geneva.osm.pbf",
+        ...     include_way_ids=True,
+        ... )
+        >>> print(routes[['route', 'name', 'way_count']].head())
 
         >>> # Group by route_master for service-level view
         >>> routes = extract_transit_routes(
@@ -701,6 +717,23 @@ def extract_transit_routes(
         gdf["stop_ids"] = gdf["osm_id"].apply(lambda rid: route_to_stops.get(rid, []))
         gdf["stop_count"] = gdf["stop_ids"].apply(len)
 
+    # Add way IDs if requested (before grouping, so we can aggregate ways)
+    if include_way_ids and not gdf.empty:
+        # Get route-way mapping (extracts from entire PBF file)
+        route_way_mapping = get_route_way_mapping(
+            osm_pbf_path=osm_pbf_path,
+            route_types=route_types,
+        )
+
+        # Create a mapping from route_id to list of way_ids
+        route_to_ways: dict[int, list[int]] = {}
+        for route_id, way_ids in route_way_mapping.items():
+            route_to_ways[route_id] = way_ids
+
+        # Add way_ids column
+        gdf["way_ids"] = gdf["osm_id"].apply(lambda rid: route_to_ways.get(rid, []))
+        gdf["way_count"] = gdf["way_ids"].apply(len)
+
     # Apply grouping if requested
     if group_by == "route_master" and not gdf.empty:
         # Filter to only routes that have a route_master
@@ -726,6 +759,12 @@ def extract_transit_routes(
                     set(sum(stops.tolist(), []))
                 )  # union of all stop lists
 
+            # If way_ids exist, aggregate them too
+            if "way_ids" in grouped_routes.columns:
+                agg_dict["way_ids"] = lambda ways: list(
+                    set(sum(ways.tolist(), []))
+                )  # union of all way lists
+
             grouped_gdf = grouped_routes.groupby("route_master_id", as_index=False).agg(
                 agg_dict
             )
@@ -745,6 +784,10 @@ def extract_transit_routes(
             if "stop_ids" in grouped_gdf.columns:
                 grouped_gdf["stop_count"] = grouped_gdf["stop_ids"].apply(len)
 
+            # Recalculate way_count if way_ids exist
+            if "way_ids" in grouped_gdf.columns:
+                grouped_gdf["way_count"] = grouped_gdf["way_ids"].apply(len)
+
             # Reorder columns
             base_cols = [
                 "osm_id",
@@ -759,6 +802,8 @@ def extract_transit_routes(
             ]
             if "stop_ids" in grouped_gdf.columns:
                 base_cols.extend(["stop_ids", "stop_count"])
+            if "way_ids" in grouped_gdf.columns:
+                base_cols.extend(["way_ids", "way_count"])
             base_cols.append("geometry")
 
             # Keep only columns that exist
@@ -796,6 +841,7 @@ def extract_all_transit_routes(
     crs: str = "EPSG:4326",
     output_path: Optional[str] = None,
     include_stop_ids: bool = False,
+    include_way_ids: bool = False,
     group_by: str = "route",
 ) -> gpd.GeoDataFrame:
     """
@@ -818,6 +864,9 @@ def extract_all_transit_routes(
         include_stop_ids (bool): If True, adds stop_ids (list of stop OSM IDs)
             columns to the output GeoDataFrame.
             Default is False.
+        include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
+            and way_count (number of highway ways) columns to the output GeoDataFrame.
+            Only ways with non-empty highway tags are included. Default is False.
         group_by (str): How to group route variants. Options:
             - "route" (default): One row per route relation (individual directional variants)
             - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
@@ -838,6 +887,8 @@ def extract_all_transit_routes(
             - website: Route website URL
             - geometry: Route path (LineString/MultiLineString)
             - stop_ids: (if include_stop_ids=True) List of stop OSM IDs on this route
+            - way_ids: (if include_way_ids=True) List of way OSM IDs with highway tags composing route
+            - way_count: (if include_way_ids=True) Number of highway ways on this route
 
     Examples:
         >>> # Extract all routes from PBF file
@@ -860,6 +911,13 @@ def extract_all_transit_routes(
         ...     include_stop_ids=True,
         ... )
 
+        >>> # Extract routes with way IDs (highway segments)
+        >>> routes = extract_all_transit_routes(
+        ...     osm_pbf_path="geneva-greater-area.osm.pbf",
+        ...     include_way_ids=True,
+        ... )
+        >>> print(f"Routes have an average of {routes['way_count'].mean():.1f} highway ways")
+
     See Also:
         - clip_transit_routes(): Fast clipping of pre-extracted routes
     """
@@ -877,6 +935,7 @@ def extract_all_transit_routes(
         crs=crs,
         osm_pbf_path=osm_pbf_path,
         include_stop_ids=include_stop_ids,
+        include_way_ids=include_way_ids,
         group_by=group_by,
     )
 
@@ -1025,6 +1084,119 @@ def get_route_stop_mapping(
     result = dict(handler.route_stops)
 
     return result
+
+
+def get_route_way_mapping(
+    osm_pbf_path: str,
+    route_types: list[str] | None = None,
+) -> dict[int, list[int]]:
+    """
+    Extract mapping of transit routes to their member ways (filtered by highway tag).
+
+    This function parses route relations from OSM data and builds a mapping
+    of which ways (with highway tags) belong to which routes. Only ways that have
+    a non-empty highway tag are included, representing the actual road/track
+    segments that compose the route geometry.
+
+    The function uses a two-pass approach:
+    1. Extract way member IDs from route relations
+    2. Build a set of all ways that have highway tags
+    3. Filter route ways to only include those with highway tags
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+        route_types (list[str], optional): List of route types to extract (e.g., ["train", "bus", "tram"]).
+            Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+
+    Returns:
+        dict[int, list[int]]: Dictionary mapping route OSM relation ID to list of way OSM IDs
+            (only ways with highway tags). Way IDs are in the order they appear in the route relation.
+            Example: {123456: [1001, 1002, 1003], 123457: [1004, 1005]}
+
+    Examples:
+        >>> # Get way mapping for bus and tram routes
+        >>> mapping = get_route_way_mapping(
+        ...     osm_pbf_path="geneva-greater-area.osm.pbf",
+        ...     route_types=["bus", "tram"]
+        ... )
+        >>> route_id = list(mapping.keys())[0]
+        >>> print(f"Route {route_id} has {len(mapping[route_id])} highway ways")
+        Route 123456 has 15 highway ways
+
+        >>> # Check which routes have no highway ways
+        >>> routes_without_ways = [rid for rid, ways in mapping.items() if len(ways) == 0]
+        >>> print(f"{len(routes_without_ways)} routes have no highway ways")
+
+    Notes:
+        - Only ways with non-empty highway tags are included (e.g., highway=primary, highway=residential)
+        - Ways are returned in the order they appear in the OSM route relation
+        - Routes with no highway ways will have an empty list in the mapping
+        - Performance: Two-pass approach, ~30-60 seconds for 68MB file
+    """
+    # Set defaults
+    if route_types is None:
+        route_types = ["train", "bus", "tram", "subway", "trolleybus", "light_rail"]
+
+    if not osm_pbf_path or not os.path.exists(osm_pbf_path):
+        raise ValueError(
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
+        )
+
+    # Pass 1: Extract way IDs from route relations
+    class RouteWayHandler(osmium.SimpleHandler):
+        def __init__(self, route_types):
+            super().__init__()
+            self.route_types = set(route_types)
+            self.route_ways = defaultdict(list)
+
+        def relation(self, r):
+            # Check if it's a route relation of the right type
+            if r.tags.get("type") != "route":
+                return
+
+            route_type = r.tags.get("route")
+            if route_type not in self.route_types:
+                return
+
+            # Extract member ways (road/track segments)
+            for member in r.members:
+                if member.type == "w":  # way
+                    self.route_ways[r.id].append(member.ref)
+
+    # Pass 2: Build set of ways with highway tags
+    class HighwayWayHandler(osmium.SimpleHandler):
+        def __init__(self):
+            super().__init__()
+            self.highway_ways = set()
+
+        def way(self, w):
+            # Check if way has a highway tag
+            if "highway" in w.tags and w.tags.get("highway"):
+                self.highway_ways.add(w.id)
+
+    # Execute pass 1: Get ways from route relations
+    route_handler = RouteWayHandler(route_types)
+    route_handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    # Get all way IDs that are referenced in routes
+    all_route_way_ids = set()
+    for way_list in route_handler.route_ways.values():
+        all_route_way_ids.update(way_list)
+
+    # Execute pass 2: Get ways with highway tags
+    highway_handler = HighwayWayHandler()
+    highway_handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    # Filter route ways to only include those with highway tags
+    filtered_route_ways = {}
+    for route_id, way_ids in route_handler.route_ways.items():
+        # Keep only ways that have highway tags (preserve order)
+        filtered_ways = [
+            way_id for way_id in way_ids if way_id in highway_handler.highway_ways
+        ]
+        filtered_route_ways[route_id] = filtered_ways
+
+    return filtered_route_ways
 
 
 def save_route_stop_mapping(mapping: dict[int, list[int]], output_path: str) -> None:
