@@ -2,7 +2,6 @@ import os
 from typing import Dict, Optional
 
 import geopandas as gpd
-import pyogrio
 
 from extractosm.utils import _parse_osm_tags
 
@@ -48,12 +47,12 @@ def get_osm_features(
             f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
         )
 
-    # If a local OSM PBF is provided and exists, use the pyosmium handler
-    gdf = pyogrio.read_dataframe(
+    gdf = gpd.read_file(
         osm_pbf_path,
         layer="points",
         bbox=bounding_box,
     )
+
     if "other_tags" in gdf.columns:
         gdf["tags"] = gdf["other_tags"].apply(_parse_osm_tags)
     else:
@@ -113,6 +112,10 @@ def get_osm_features(
         var_name="variable",
         value_name="value",
     )
+
     gdf_long = gdf_long[gdf_long["value"].notna()].reset_index(drop=True)
+
+    # Convert back to GeoDataFrame (melt converts to DataFrame)
+    gdf_long = gpd.GeoDataFrame(gdf_long, geometry="geometry", crs=gdf.crs)
 
     return gdf_long
