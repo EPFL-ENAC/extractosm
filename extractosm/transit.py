@@ -1543,6 +1543,7 @@ def extract_transit_network(
     crs: str = "EPSG:4326",
     include_stop_ids: bool = False,
     include_route_ids: bool = False,
+    include_way_ids: bool = False,
     output_dir: Optional[str] = None,
 ) -> dict:
     """
@@ -1556,12 +1557,15 @@ def extract_transit_network(
         route_types (list[str], optional): List of route types to include (e.g., ["train", "bus"]). Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
         include_networks (list[str], optional): List of network names to include. If None, includes all networks. Default is None.
         exclude_networks (list[str], optional): List of network names to exclude. If None, excludes no networks. Default is None.
-        group_by_ref (bool): If True, groups routes by (ref, network) and combines bidirectional routes. Default is True.
+        group_by (string): Specifies how to group route variants. Options:
+            - "route" (default): One row per route relation (individual directional variants)
+            - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
         include_all_route_stops (bool): If True, includes all stops that are members of the extracted routes, even if they fall outside the bounding box
             when using extract_transit_routes(). Default is True.
         crs (str): Coordinate reference system for output GeoDataFrames. Default is "EPSG:4326".
         include_stop_ids (bool): If True, adds stop_ids column to routes GeoDataFrame. Default is False.
         include_route_ids (bool): If True, adds route_ids column to stops GeoDataFrame. Default is False.
+        include_way_ids (bool): If True, adds way_ids column to routes GeoDataFrame. Default is False.
         output_dir (str, optional): If provided, saves intermediate GeoParquet files for routes
     """
 
@@ -1572,6 +1576,8 @@ def extract_transit_network(
         route_types=route_types,
         crs=crs,
         include_stop_ids=include_stop_ids,
+        include_way_ids=include_way_ids,
+        group_by=group_by,
     )
     stops = extract_all_transit_stops(
         osm_pbf_path, crs=crs, include_route_ids=include_route_ids
