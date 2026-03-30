@@ -1,6 +1,6 @@
 [project]
 name = "extractosm"
-version = "0.1.1"
+version = "0.1.2"
 description = "Convenience package to extract various features from OpenStreetMap"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -9,13 +9,13 @@ dependencies = [
     "osmium>=4.3.0",
     "osmnx>=2.1.0",
     "pyarrow>=23.0.1",
-    "pyogrio>=0.12.1",
 ]
 
 [project.optional-dependencies]
 example = [
     "contextily>=1.7.0",
     "matplotlib>=3.10.8",
+    "ipykernel>=7.2.0",
 ]
 
 [dependency-groups]
