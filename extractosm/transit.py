@@ -629,7 +629,6 @@ def extract_transit_routes(
         gdf["route"] = gdf["tags"].apply(lambda d: d.get("route"))
 
         # Filter for route relations with matching route types
-        # Note: PBF files may not have type="route" as a direct tag
         # We filter by route tag directly
         gdf = gdf[gdf["route"].isin(route_types)].copy()
 
@@ -1758,7 +1757,6 @@ def extract_transit_network(
     include_way_ids: bool = False,
     output_dir: Optional[str] = None,
     exclude_platforms: bool = True,
-    include_way_ids: bool = False,
 ) -> dict:
     """
     Extract transit routes and stops from OSM PBF file.
@@ -1779,12 +1777,11 @@ def extract_transit_network(
         crs (str): Coordinate reference system for output GeoDataFrames. Default is "EPSG:4326".
         include_stop_ids (bool): If True, adds stop_ids column to routes GeoDataFrame. Default is False.
         include_route_ids (bool): If True, adds route_ids column to stops GeoDataFrame. Default is False.
-        include_way_ids (bool): If True, adds way_ids column to routes GeoDataFrame. Default is False.
-        output_dir (str, optional): If provided, saves intermediate GeoParquet files for routes
         include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
             and way_count (number of highway ways) columns to the output GeoDataFrame.
             Only ways with non-empty highway tags are included. When exclude_platforms=True,
             platform ways are also excluded from way_ids. Default is False.
+        output_dir (str, optional): If provided, saves intermediate GeoParquet files for routes
         group_by (str): How to group route variants. Options:
             - "route" (default): One row per route relation (individual directional variants)
             - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
