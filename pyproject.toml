@@ -11,17 +11,15 @@ dependencies = [
     "pyarrow>=23.0.1",
 ]
 
-[project.optional-dependencies]
-example = [
-    "contextily>=1.7.0",
-    "matplotlib>=3.10.8",
-    "ipykernel>=7.2.0",
-]
-
 [dependency-groups]
 dev = [
     "ruff>=0.15.6",
     "ty>=0.0.22",
+]
+example = [
+    "contextily>=1.7.0",
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
 ]
 
 [tool.hatch.build.targets.wheel]

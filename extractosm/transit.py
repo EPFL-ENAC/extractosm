@@ -466,7 +466,7 @@ def extract_transit_routes(
     include_stop_ids: bool = False,
     include_way_ids: bool = False,
     group_by: str = "route",
-    exclude_platforms: bool = False,
+    exclude_platforms: bool = True,
 ) -> gpd.GeoDataFrame:
     """
     Get fixed-route transit systems within a bounding box.
@@ -503,7 +503,7 @@ def extract_transit_routes(
             This results in cleaner route visualization by removing platform segments
             that are not part of the actual vehicle path. Routes with only platform ways
             will have empty geometries. Requires additional OSM file processing (2 extra passes).
-            Default is False.
+            Default is True.
 
     Returns:
         gpd.GeoDataFrame: A GeoDataFrame containing transit routes.
@@ -859,7 +859,7 @@ def extract_all_transit_routes(
     include_stop_ids: bool = False,
     include_way_ids: bool = False,
     group_by: str = "route",
-    exclude_platforms: bool = False,
+    exclude_platforms: bool = True,
 ) -> gpd.GeoDataFrame:
     """
     Extract ALL transit routes from OSM PBF file and save to GeoParquet.
@@ -894,7 +894,7 @@ def extract_all_transit_routes(
             This results in cleaner route visualization by removing platform segments
             that are not part of the actual vehicle path. Routes with only platform ways
             will have empty geometries. Requires additional OSM file processing (2 extra passes).
-            Default is False.
+            Default is True.
 
     Returns:
         gpd.GeoDataFrame: GeoDataFrame containing all transit routes with columns:
@@ -1113,7 +1113,7 @@ def get_route_stop_mapping(
 def get_route_way_mapping(
     osm_pbf_path: str,
     route_types: list[str] | None = None,
-    exclude_platforms: bool = False,
+    exclude_platforms: bool = True,
 ) -> dict[int, list[int]]:
     """
     Extract mapping of transit routes to their member ways (filtered by highway tag and/or role).
@@ -1135,7 +1135,7 @@ def get_route_way_mapping(
             Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
         exclude_platforms (bool): If True, excludes ways with platform-related roles
             ("platform", "platform_entry_only", "platform_exit_only") from the results.
-            Default is False.
+            Default is True.
 
     Returns:
         dict[int, list[int]]: Dictionary mapping route OSM relation ID to list of way OSM IDs
