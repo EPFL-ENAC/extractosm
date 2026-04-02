@@ -1757,6 +1757,8 @@ def extract_transit_network(
     include_route_ids: bool = False,
     include_way_ids: bool = False,
     output_dir: Optional[str] = None,
+    exclude_platforms: bool = True,
+    include_way_ids: bool = False,
 ) -> dict:
     """
     Extract transit routes and stops from OSM PBF file.
@@ -1779,9 +1781,21 @@ def extract_transit_network(
         include_route_ids (bool): If True, adds route_ids column to stops GeoDataFrame. Default is False.
         include_way_ids (bool): If True, adds way_ids column to routes GeoDataFrame. Default is False.
         output_dir (str, optional): If provided, saves intermediate GeoParquet files for routes
+        include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
+            and way_count (number of highway ways) columns to the output GeoDataFrame.
+            Only ways with non-empty highway tags are included. When exclude_platforms=True,
+            platform ways are also excluded from way_ids. Default is False.
+        group_by (str): How to group route variants. Options:
+            - "route" (default): One row per route relation (individual directional variants)
+            - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
+            - None: No grouping (may contain duplicate geometries)
+            Default is "route".
+        exclude_platforms (bool): If True, excludes platform ways from route geometries.
+            This results in cleaner route visualization by removing platform segments
+            that are not part of the actual vehicle path. Routes with only platform ways
+            will have empty geometries. Requires additional OSM file processing (2 extra passes).
+            Default is True.
     """
-
-    # TODO: switch to a bbox-based approach, make it optional as a parameter
 
     routes = extract_all_transit_routes(
         osm_pbf_path,
@@ -1790,6 +1804,7 @@ def extract_transit_network(
         include_stop_ids=include_stop_ids,
         include_way_ids=include_way_ids,
         group_by=group_by,
+        exclude_platforms=exclude_platforms
     )
     stops = extract_all_transit_stops(
         osm_pbf_path, crs=crs, include_route_ids=include_route_ids
