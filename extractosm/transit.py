@@ -14,6 +14,10 @@ import pyarrow  # noqa: F401 - for checking if pyarrow is installed when saving 
 from extractosm.utils import _parse_osm_tags
 
 
+# Platform-related roles to exclude when exclude_platforms=True
+PLATFORM_ROLES = {"platform", "platform_entry_only", "platform_exit_only"}
+
+
 def _infer_transit_mode(tags: dict) -> Optional[str]:
     """
     Infer transit mode from OSM tags.
@@ -462,6 +466,7 @@ def extract_transit_routes(
     include_stop_ids: bool = False,
     include_way_ids: bool = False,
     group_by: str = "route",
+    exclude_platforms: bool = False,
 ) -> gpd.GeoDataFrame:
     """
     Get fixed-route transit systems within a bounding box.
@@ -488,11 +493,17 @@ def extract_transit_routes(
             Default is False.
         include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
             and way_count (number of highway ways) columns to the output GeoDataFrame.
-            Only ways with non-empty highway tags are included. Default is False.
+            Only ways with non-empty highway tags are included. When exclude_platforms=True,
+            platform ways are also excluded from way_ids. Default is False.
         group_by (str): How to group routes in the output. Default is "route".
             - "route": One row per route variant (e.g., "Bus 7 A→B" and "Bus 7 B→A" are separate)
             - "route_master": One row per service (e.g., single "Bus 7" row combining all variants)
             - None: No grouping (may include duplicate routes from overlapping relations)
+        exclude_platforms (bool): If True, excludes platform ways from route geometries.
+            This results in cleaner route visualization by removing platform segments
+            that are not part of the actual vehicle path. Routes with only platform ways
+            will have empty geometries. Requires additional OSM file processing (2 extra passes).
+            Default is False.
 
     Returns:
         gpd.GeoDataFrame: A GeoDataFrame containing transit routes.
@@ -673,6 +684,10 @@ def extract_transit_routes(
     # Reset index
     gdf = gdf.reset_index(drop=True)
 
+    # Filter platform ways from geometry if requested
+    if exclude_platforms and not gdf.empty:
+        gdf = _rebuild_geometries_excluding_platforms(gdf, osm_pbf_path, route_types)
+
     # Add route_master information (always included)
     if not gdf.empty:
         # Get route→route_master mapping
@@ -723,6 +738,7 @@ def extract_transit_routes(
         route_way_mapping = get_route_way_mapping(
             osm_pbf_path=osm_pbf_path,
             route_types=route_types,
+            exclude_platforms=exclude_platforms,
         )
 
         # Create a mapping from route_id to list of way_ids
@@ -843,6 +859,7 @@ def extract_all_transit_routes(
     include_stop_ids: bool = False,
     include_way_ids: bool = False,
     group_by: str = "route",
+    exclude_platforms: bool = False,
 ) -> gpd.GeoDataFrame:
     """
     Extract ALL transit routes from OSM PBF file and save to GeoParquet.
@@ -866,12 +883,18 @@ def extract_all_transit_routes(
             Default is False.
         include_way_ids (bool): If True, adds way_ids (list of way OSM IDs with highway tags)
             and way_count (number of highway ways) columns to the output GeoDataFrame.
-            Only ways with non-empty highway tags are included. Default is False.
+            Only ways with non-empty highway tags are included. When exclude_platforms=True,
+            platform ways are also excluded from way_ids. Default is False.
         group_by (str): How to group route variants. Options:
             - "route" (default): One row per route relation (individual directional variants)
             - "route_master": One row per route_master (service-level grouping, e.g., "Bus 7")
             - None: No grouping (may contain duplicate geometries)
             Default is "route".
+        exclude_platforms (bool): If True, excludes platform ways from route geometries.
+            This results in cleaner route visualization by removing platform segments
+            that are not part of the actual vehicle path. Routes with only platform ways
+            will have empty geometries. Requires additional OSM file processing (2 extra passes).
+            Default is False.
 
     Returns:
         gpd.GeoDataFrame: GeoDataFrame containing all transit routes with columns:
@@ -937,6 +960,7 @@ def extract_all_transit_routes(
         include_stop_ids=include_stop_ids,
         include_way_ids=include_way_ids,
         group_by=group_by,
+        exclude_platforms=exclude_platforms,
     )
 
     # Save to GeoParquet if output path specified
@@ -1089,32 +1113,38 @@ def get_route_stop_mapping(
 def get_route_way_mapping(
     osm_pbf_path: str,
     route_types: list[str] | None = None,
+    exclude_platforms: bool = False,
 ) -> dict[int, list[int]]:
     """
-    Extract mapping of transit routes to their member ways (filtered by highway tag).
+    Extract mapping of transit routes to their member ways (filtered by highway tag and/or role).
 
     This function parses route relations from OSM data and builds a mapping
-    of which ways (with highway tags) belong to which routes. Only ways that have
+    of which ways belong to which routes. By default, only ways that have
     a non-empty highway tag are included, representing the actual road/track
-    segments that compose the route geometry.
+    segments that compose the route geometry. Optionally, platform ways can
+    be excluded.
 
     The function uses a two-pass approach:
-    1. Extract way member IDs from route relations
+    1. Extract way member IDs with roles from route relations
     2. Build a set of all ways that have highway tags
-    3. Filter route ways to only include those with highway tags
+    3. Filter route ways based on highway tags and/or platform role
 
     Args:
         osm_pbf_path (str): Path to local .osm.pbf file.
         route_types (list[str], optional): List of route types to extract (e.g., ["train", "bus", "tram"]).
             Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+        exclude_platforms (bool): If True, excludes ways with platform-related roles
+            ("platform", "platform_entry_only", "platform_exit_only") from the results.
+            Default is False.
 
     Returns:
         dict[int, list[int]]: Dictionary mapping route OSM relation ID to list of way OSM IDs
-            (only ways with highway tags). Way IDs are in the order they appear in the route relation.
+            (filtered by highway tags and optionally excluding platforms).
+            Way IDs are in the order they appear in the route relation.
             Example: {123456: [1001, 1002, 1003], 123457: [1004, 1005]}
 
     Examples:
-        >>> # Get way mapping for bus and tram routes
+        >>> # Get way mapping for bus and tram routes (highway-tagged ways only)
         >>> mapping = get_route_way_mapping(
         ...     osm_pbf_path="geneva-greater-area.osm.pbf",
         ...     route_types=["bus", "tram"]
@@ -1123,14 +1153,18 @@ def get_route_way_mapping(
         >>> print(f"Route {route_id} has {len(mapping[route_id])} highway ways")
         Route 123456 has 15 highway ways
 
-        >>> # Check which routes have no highway ways
-        >>> routes_without_ways = [rid for rid, ways in mapping.items() if len(ways) == 0]
-        >>> print(f"{len(routes_without_ways)} routes have no highway ways")
+        >>> # Get ways excluding platforms
+        >>> mapping = get_route_way_mapping(
+        ...     osm_pbf_path="geneva-greater-area.osm.pbf",
+        ...     route_types=["bus"],
+        ...     exclude_platforms=True
+        ... )
 
     Notes:
         - Only ways with non-empty highway tags are included (e.g., highway=primary, highway=residential)
+        - When exclude_platforms=True, ways with platform-related roles are additionally excluded
         - Ways are returned in the order they appear in the OSM route relation
-        - Routes with no highway ways will have an empty list in the mapping
+        - Routes with no matching ways will have an empty list in the mapping
         - Performance: Two-pass approach, ~30-60 seconds for 68MB file
     """
     # Set defaults
@@ -1142,7 +1176,7 @@ def get_route_way_mapping(
             f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
         )
 
-    # Pass 1: Extract way IDs from route relations
+    # Pass 1: Extract way IDs with roles from route relations
     class RouteWayHandler(osmium.SimpleHandler):
         def __init__(self, route_types):
             super().__init__()
@@ -1158,10 +1192,10 @@ def get_route_way_mapping(
             if route_type not in self.route_types:
                 return
 
-            # Extract member ways (road/track segments)
+            # Extract member ways with their roles
             for member in r.members:
                 if member.type == "w":  # way
-                    self.route_ways[r.id].append(member.ref)
+                    self.route_ways[r.id].append((member.ref, member.role))
 
     # Pass 2: Build set of ways with highway tags
     class HighwayWayHandler(osmium.SimpleHandler):
@@ -1174,29 +1208,112 @@ def get_route_way_mapping(
             if "highway" in w.tags and w.tags.get("highway"):
                 self.highway_ways.add(w.id)
 
-    # Execute pass 1: Get ways from route relations
+    # Execute pass 1: Get ways with roles from route relations
     route_handler = RouteWayHandler(route_types)
     route_handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
 
     # Get all way IDs that are referenced in routes
     all_route_way_ids = set()
-    for way_list in route_handler.route_ways.values():
-        all_route_way_ids.update(way_list)
+    for way_role_list in route_handler.route_ways.values():
+        all_route_way_ids.update(way_id for way_id, _ in way_role_list)
 
     # Execute pass 2: Get ways with highway tags
     highway_handler = HighwayWayHandler()
     highway_handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
 
-    # Filter route ways to only include those with highway tags
+    # Filter route ways based on highway tags and platform role
     filtered_route_ways = {}
-    for route_id, way_ids in route_handler.route_ways.items():
-        # Keep only ways that have highway tags (preserve order)
+    for route_id, way_role_list in route_handler.route_ways.items():
+        # Apply both filters: highway tag AND optionally exclude platforms
         filtered_ways = [
-            way_id for way_id in way_ids if way_id in highway_handler.highway_ways
+            way_id
+            for way_id, role in way_role_list
+            if way_id in highway_handler.highway_ways
+            and (not exclude_platforms or role not in PLATFORM_ROLES)
         ]
         filtered_route_ways[route_id] = filtered_ways
 
     return filtered_route_ways
+
+
+def get_route_way_roles(
+    osm_pbf_path: str,
+    route_types: list[str] | None = None,
+) -> dict[int, list[tuple[int, str]]]:
+    """
+    Extract mapping of transit routes to their way members WITH roles.
+
+    This function is similar to get_route_way_mapping() but includes role
+    information for each way member. This is useful for filtering platforms
+    or other role-specific way members from route geometries.
+
+    Args:
+        osm_pbf_path (str): Path to local .osm.pbf file.
+        route_types (list[str], optional): List of route types to extract (e.g., ["train", "bus", "tram"]).
+            Default is ["train", "bus", "tram", "subway", "trolleybus", "light_rail"].
+
+    Returns:
+        dict[int, list[tuple[int, str]]]: Dictionary mapping route OSM relation ID to
+            list of (way_id, role) tuples. The role is the member's role in the relation
+            (e.g., "", "platform", etc.).
+            Example: {79743: [(315757166, 'platform'), (23456, ''), ...]}
+
+    Examples:
+        >>> # Get way roles for metro routes
+        >>> mapping = get_route_way_roles(
+        ...     osm_pbf_path="lausanne.osm.pbf",
+        ...     route_types=["subway"]
+        ... )
+        >>> route_id = 79743
+        >>> way_roles = mapping[route_id]
+        >>> platforms = [(wid, role) for wid, role in way_roles if role == 'platform']
+        >>> print(f"Route {route_id} has {len(platforms)} platform ways")
+        Route 79743 has 14 platform ways
+
+    Notes:
+        - Role can be empty string ("") for ways that are part of the route path
+        - Common roles: "", "platform", "stop", "forward", "backward"
+        - Ways are returned in the order they appear in the OSM route relation
+        - Performance: Single pass through relations, ~5-10 seconds for 68MB file
+    """
+    # Set defaults
+    if route_types is None:
+        route_types = ["train", "bus", "tram", "subway", "trolleybus", "light_rail"]
+
+    if not osm_pbf_path or not os.path.exists(osm_pbf_path):
+        raise ValueError(
+            f"OSM PBF file not found: {osm_pbf_path}. Provide a valid path."
+        )
+
+    # Extract way IDs with roles from route relations
+    class RouteWayRoleHandler(osmium.SimpleHandler):
+        def __init__(self, route_types):
+            super().__init__()
+            self.route_types = set(route_types)
+            self.route_way_roles = defaultdict(list)
+
+        def relation(self, r):
+            # Check if it's a route relation of the right type
+            if r.tags.get("type") != "route":
+                return
+
+            route_type = r.tags.get("route")
+            if route_type not in self.route_types:
+                return
+
+            # Extract member ways with their roles
+            for member in r.members:
+                if member.type == "w":  # way
+                    self.route_way_roles[r.id].append((member.ref, member.role))
+
+    # Execute pass: Get ways with roles from route relations
+    handler = RouteWayRoleHandler(route_types)
+    handler.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    # Convert to regular dict
+    result = dict(handler.route_way_roles)
+
+    return result
 
 
 def save_route_stop_mapping(mapping: dict[int, list[int]], output_path: str) -> None:
@@ -1297,6 +1414,101 @@ def load_route_stop_mapping(input_path: str) -> dict[int, list[int]]:
     mapping = dict(zip(df["route_id"], df["stop_ids"]))
 
     return mapping
+
+
+def _rebuild_geometries_excluding_platforms(
+    routes_gdf: gpd.GeoDataFrame,
+    osm_pbf_path: str,
+    route_types: list[str] | None = None,
+) -> gpd.GeoDataFrame:
+    """
+    Rebuild route geometries excluding platform ways.
+
+    This function takes a GeoDataFrame of routes (with geometries from pyogrio
+    that include all ways) and rebuilds the geometries to exclude ways with
+    platform-related roles ("platform", "platform_entry_only", "platform_exit_only").
+    This is useful for cleaner route visualization.
+
+    Args:
+        routes_gdf (gpd.GeoDataFrame): GeoDataFrame with routes from pyogrio.
+            Must have 'osm_id' and 'geometry' columns.
+        osm_pbf_path (str): Path to OSM PBF file.
+        route_types (list[str], optional): List of route types to extract.
+
+    Returns:
+        gpd.GeoDataFrame: GeoDataFrame with geometries rebuilt (platforms excluded).
+            Routes with only platform ways will have empty geometries.
+    """
+    from shapely.geometry import MultiLineString
+
+    # Get way roles for all routes
+    route_way_roles = get_route_way_roles(osm_pbf_path, route_types)
+
+    # For each route, filter out platform ways
+    route_filtered_ways = {}
+    all_needed_way_ids = set()
+
+    for route_id in routes_gdf["osm_id"]:
+        if route_id in route_way_roles:
+            # Filter out ways with platform-related roles
+            non_platform_ways = [
+                way_id
+                for way_id, role in route_way_roles[route_id]
+                if role not in PLATFORM_ROLES
+            ]
+            route_filtered_ways[route_id] = non_platform_ways
+            all_needed_way_ids.update(non_platform_ways)
+        else:
+            route_filtered_ways[route_id] = []
+
+    # Extract geometries for all needed ways using osmium
+    class WayGeometryExtractor(osmium.SimpleHandler):
+        """Extract LineString geometries for specific way IDs"""
+
+        def __init__(self, way_ids: set[int]):
+            super().__init__()
+            self.way_ids = way_ids
+            self.geometries = {}  # way_id -> LineString
+            self.wkb_factory = osmium.geom.WKBFactory()
+
+        def way(self, w):
+            if w.id in self.way_ids:
+                try:
+                    geom_wkb = self.wkb_factory.create_linestring(w)
+                    self.geometries[w.id] = wkb.loads(geom_wkb, hex=True)
+                except Exception:
+                    pass  # Skip invalid geometries
+
+    # Extract way geometries
+    way_extractor = WayGeometryExtractor(all_needed_way_ids)
+    way_extractor.apply_file(osm_pbf_path, locations=True, idx="sparse_file_array")
+
+    # Rebuild geometries for each route
+    new_geometries = []
+    for route_id in routes_gdf["osm_id"]:
+        way_ids = route_filtered_ways.get(route_id, [])
+
+        if not way_ids:
+            # No non-platform ways - create empty geometry
+            new_geometries.append(MultiLineString())
+        else:
+            # Collect LineStrings in order
+            linestrings = []
+            for way_id in way_ids:
+                if way_id in way_extractor.geometries:
+                    linestrings.append(way_extractor.geometries[way_id])
+
+            if linestrings:
+                new_geometries.append(MultiLineString(linestrings))
+            else:
+                # All ways had invalid geometries
+                new_geometries.append(MultiLineString())
+
+    # Replace geometry column
+    routes_gdf = routes_gdf.copy()
+    routes_gdf["geometry"] = new_geometries
+
+    return routes_gdf
 
 
 def get_route_masters(
