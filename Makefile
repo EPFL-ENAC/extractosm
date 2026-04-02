@@ -25,7 +25,7 @@ install: ## Install dependencies
 	uv sync --dev
 
 install-example: ## Install dependencies for example usage
-	uv sync --dev --all-extras
+	uv sync --group example
 
 # Variables
 UV := uv
