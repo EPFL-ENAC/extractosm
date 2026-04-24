@@ -17,6 +17,14 @@ from extractosm.utils import _parse_osm_tags
 # Platform-related roles to exclude when exclude_platforms=True
 PLATFORM_ROLES = {"platform", "platform_entry_only", "platform_exit_only"}
 
+# Platform-related tag combinations to exclude when exclude_platforms=True
+# A way is considered a platform if it has any of these tag combinations:
+# - public_transport=platform
+# - highway=platform
+# - railway=platform
+PLATFORM_TAG_KEYS = {"public_transport", "highway", "railway"}
+PLATFORM_TAG_VALUE = "platform"
+
 
 def _infer_transit_mode(tags: dict) -> Optional[str]:
     """
@@ -500,9 +508,12 @@ def extract_transit_routes(
             - "route_master": One row per service (e.g., single "Bus 7" row combining all variants)
             - None: No grouping (may include duplicate routes from overlapping relations)
         exclude_platforms (bool): If True, excludes platform ways from route geometries.
+            Platform ways are identified by BOTH role and tags:
+            - Ways with platform roles ("platform", "platform_entry_only", "platform_exit_only")
+            - Ways with platform tags (public_transport=platform, highway=platform, railway=platform)
             This results in cleaner route visualization by removing platform segments
             that are not part of the actual vehicle path. Routes with only platform ways
-            will have empty geometries. Requires additional OSM file processing (2 extra passes).
+            will have empty geometries. Requires additional OSM file processing (3 extra passes).
             Default is True.
 
     Returns:
@@ -890,9 +901,12 @@ def extract_all_transit_routes(
             - None: No grouping (may contain duplicate geometries)
             Default is "route".
         exclude_platforms (bool): If True, excludes platform ways from route geometries.
+            Platform ways are identified by BOTH role and tags:
+            - Ways with platform roles ("platform", "platform_entry_only", "platform_exit_only")
+            - Ways with platform tags (public_transport=platform, highway=platform, railway=platform)
             This results in cleaner route visualization by removing platform segments
             that are not part of the actual vehicle path. Routes with only platform ways
-            will have empty geometries. Requires additional OSM file processing (2 extra passes).
+            will have empty geometries. Requires additional OSM file processing (3 extra passes).
             Default is True.
 
     Returns:
@@ -1424,9 +1438,12 @@ def _rebuild_geometries_excluding_platforms(
     Rebuild route geometries excluding platform ways.
 
     This function takes a GeoDataFrame of routes (with geometries from pyogrio
-    that include all ways) and rebuilds the geometries to exclude ways with
-    platform-related roles ("platform", "platform_entry_only", "platform_exit_only").
-    This is useful for cleaner route visualization.
+    that include all ways) and rebuilds the geometries to exclude ways that are
+    platforms based on BOTH:
+    - Platform-related roles ("platform", "platform_entry_only", "platform_exit_only")
+    - Platform-related tags (public_transport=platform, highway=platform, railway=platform)
+
+    This ensures consistent filtering regardless of how platforms are tagged in OSM.
 
     Args:
         routes_gdf (gpd.GeoDataFrame): GeoDataFrame with routes from pyogrio.
@@ -1443,22 +1460,58 @@ def _rebuild_geometries_excluding_platforms(
     # Get way roles for all routes
     route_way_roles = get_route_way_roles(osm_pbf_path, route_types)
 
-    # For each route, filter out platform ways
-    route_filtered_ways = {}
-    all_needed_way_ids = set()
+    # Collect all candidate way IDs (filtered by role first)
+    route_candidate_ways = {}
+    all_candidate_way_ids = set()
 
     for route_id in routes_gdf["osm_id"]:
         if route_id in route_way_roles:
             # Filter out ways with platform-related roles
-            non_platform_ways = [
+            non_platform_role_ways = [
                 way_id
                 for way_id, role in route_way_roles[route_id]
                 if role not in PLATFORM_ROLES
             ]
-            route_filtered_ways[route_id] = non_platform_ways
-            all_needed_way_ids.update(non_platform_ways)
+            route_candidate_ways[route_id] = non_platform_role_ways
+            all_candidate_way_ids.update(non_platform_role_ways)
         else:
-            route_filtered_ways[route_id] = []
+            route_candidate_ways[route_id] = []
+
+    # Now check tags to filter out ways with platform tags
+    # Even if a way has an empty role, it should be excluded if it has platform tags
+    class PlatformTagChecker(osmium.SimpleHandler):
+        """Check which ways have platform tags"""
+
+        def __init__(self, way_ids: set[int]):
+            super().__init__()
+            self.way_ids = way_ids
+            self.platform_ways = set()  # way_ids that are platforms based on tags
+
+        def way(self, w):
+            if w.id in self.way_ids:
+                # Check if way has any platform-related tags
+                for tag_key in PLATFORM_TAG_KEYS:
+                    if w.tags.get(tag_key) == PLATFORM_TAG_VALUE:
+                        self.platform_ways.add(w.id)
+                        break  # No need to check other tags
+
+    # Check which candidate ways have platform tags
+    tag_checker = PlatformTagChecker(all_candidate_way_ids)
+    tag_checker.apply_file(osm_pbf_path, locations=False, idx="sparse_file_array")
+
+    # Filter out ways with platform tags
+    route_filtered_ways = {}
+    all_needed_way_ids = set()
+
+    for route_id, candidate_ways in route_candidate_ways.items():
+        # Exclude ways that have platform tags
+        non_platform_ways = [
+            way_id
+            for way_id in candidate_ways
+            if way_id not in tag_checker.platform_ways
+        ]
+        route_filtered_ways[route_id] = non_platform_ways
+        all_needed_way_ids.update(non_platform_ways)
 
     # Extract geometries for all needed ways using osmium
     class WayGeometryExtractor(osmium.SimpleHandler):
@@ -1801,7 +1854,7 @@ def extract_transit_network(
         include_stop_ids=include_stop_ids,
         include_way_ids=include_way_ids,
         group_by=group_by,
-        exclude_platforms=exclude_platforms
+        exclude_platforms=exclude_platforms,
     )
     stops = extract_all_transit_stops(
         osm_pbf_path, crs=crs, include_route_ids=include_route_ids
